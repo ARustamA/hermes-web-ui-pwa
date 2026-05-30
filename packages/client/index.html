@@ -4,24 +4,26 @@
 <head>
   <meta charset="UTF-8" />
   <link rel="icon" type="image/svg+xml" href="/favicon.ico" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <meta name="theme-color" content="#1a1a2e" />
+  <meta name="description" content="Self-hosted AI chat dashboard for Hermes Agent" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="Hermes" />
+  <link rel="apple-touch-icon" href="/icons/icon.svg" />
   <title>Hermes</title>
 
-  <!-- Prevent FOUC by applying theme classes immediately -->
   <script>
     (function() {
       try {
         const brightness = localStorage.getItem('hermes_brightness') || 'system';
         const style = localStorage.getItem('hermes_style') || 'ink';
 
-        // Resolve dark mode
         const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
         const isDark = brightness === 'dark' || (brightness === 'system' && prefersDark);
 
-        // Resolve comic style
         const isComic = style === 'comic';
 
-        // Apply classes immediately
         if (isDark) {
           document.documentElement.classList.add('dark');
         }

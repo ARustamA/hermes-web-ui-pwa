@@ -1,5 +1,6 @@
 import { defineConfig } from 'vite'
 import vue from '@vitejs/plugin-vue'
+import { VitePWA } from 'vite-plugin-pwa'
 import type { ProxyOptions } from 'vite'
 import { resolve } from 'path'
 import pkg from './package.json'
@@ -28,7 +29,65 @@ function createProxyConfig(): ProxyOptions {
 
 export default defineConfig({
   root: 'packages/client',
-  plugins: [vue()],
+  plugins: [
+    vue(),
+    VitePWA({
+      registerType: 'autoUpdate',
+      includeAssets: ['favicon.ico', 'icons/*.svg'],
+      manifest: {
+        name: 'Hermes Web UI',
+        short_name: 'Hermes',
+        description: 'Self-hosted AI chat dashboard for Hermes Agent',
+        theme_color: '#1a1a2e',
+        background_color: '#1a1a2e',
+        display: 'standalone',
+        orientation: 'portrait',
+        scope: '/',
+        start_url: '/',
+        icons: [
+          {
+            src: '/icons/icon.svg',
+            sizes: 'any',
+            type: 'image/svg+xml',
+            purpose: 'any maskable',
+          },
+        ],
+      },
+      workbox: {
+        globPatterns: ['**/*.{js,css,html,ico,svg,woff2}'],
+        runtimeCaching: [
+          {
+            urlPattern: /^https:\/\/fonts\.googleapis\.com\/.*/i,
+            handler: 'CacheFirst',
+            options: {
+              cacheName: 'google-fonts-cache',
+              expiration: {
+                maxEntries: 10,
+                maxAgeSeconds: 60 * 60 * 24 * 365,
+              },
+              cacheableResponse: {
+                statuses: [0, 200],
+              },
+            },
+          },
+          {
+            urlPattern: /^https:\/\/fonts\.gstatic\.com\/.*/i,
+            handler: 'CacheFirst',
+            options: {
+              cacheName: 'gstatic-fonts-cache',
+              expiration: {
+                maxEntries: 10,
+                maxAgeSeconds: 60 * 60 * 24 * 365,
+              },
+              cacheableResponse: {
+                statuses: [0, 200],
+              },
+            },
+          },
+        ],
+      },
+    }),
+  ],
   define: {
     __APP_VERSION__: JSON.stringify(pkg.version),
   },
@@ -40,20 +99,14 @@ export default defineConfig({
   build: {
     outDir: '../../dist/client',
     emptyOutDir: true,
-    // Use esbuild for minification (much faster than terser)
     minify: 'esbuild',
-    // Disable sourcemap generation for faster builds
     sourcemap: false,
     target: 'es2020',
-    // Increase chunk size warning limit (default: 500KB)
     chunkSizeWarningLimit: 1000,
-    // CSS code splitting for better caching
     cssCodeSplit: true,
     rollupOptions: {
       output: {
-        // Manual chunk splitting to speed up rendering
         manualChunks(id) {
-          // Separate large heavy packages to avoid blocking other chunks
           if (id.includes('node_modules/monaco-editor')) {
             return 'monaco-editor'
           }
@@ -73,7 +126,6 @@ export default defineConfig({
             return 'vendor'
           }
         },
-        // Optimize chunk file names for better caching
         chunkFileNames: 'assets/js/[name]-[hash].js',
         entryFileNames: 'assets/js/[name]-[hash].js',
         assetFileNames: 'assets/[ext]/[name]-[hash].[ext]',
@@ -81,7 +133,6 @@ export default defineConfig({
     },
   },
   optimizeDeps: {
-    // Pre-bundle all large dependencies for faster builds
     include: [
       'monaco-editor',
       'mermaid',
