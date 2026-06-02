@@ -752,7 +752,19 @@ function errorMessage(err: any): string {
 }
 
 function getRepoRoot(): string {
-  return resolve(__dirname, '../../..')
+  // Try multiple candidate paths to support both dev and production
+  const candidates = [
+    resolve(__dirname, '../../..'),   // bundled: dist/server → repo root
+    resolve(__dirname, '../../../..'), // dev: packages/server/src/controllers → repo root
+    resolve(process.cwd()),           // fallback to cwd
+  ]
+  for (const candidate of candidates) {
+    const pkgPath = join(candidate, 'package.json')
+    if (existsSync(pkgPath)) {
+      return candidate
+    }
+  }
+  return candidates[0]
 }
 
 function getPatchFiles(): string[] {
