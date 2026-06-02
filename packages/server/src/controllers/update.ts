@@ -1,5 +1,5 @@
 import { execFileSync, spawn, type ChildProcess } from 'child_process'
-import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync } from 'fs'
+import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'fs'
 import { createServer } from 'net'
 import { delimiter, dirname, extname, join, resolve } from 'path'
 import { getWebUiHome } from '../config'
@@ -19,6 +19,9 @@ const PREVIEW_AGENT_BRIDGE_TRANSPORT_ENV = 'HERMES_WEB_UI_PREVIEW_AGENT_BRIDGE_T
 const PREVIEW_FRONTEND_URL = `http://localhost:${PREVIEW_FRONTEND_PORT}`
 const PREVIEW_TAG_REF_PATTERN = /^[A-Za-z0-9._/-]+$/
 const PREVIEW_MAIN_REF = 'main'
+
+const UPSTREAM_REPO_URL = 'https://github.com/EKKOLearnAI/hermes-web-ui.git'
+const PATCHES_DIR = 'packages/hermes-patches'
 
 interface PackageInfo {
   name: string
@@ -748,6 +751,82 @@ function errorMessage(err: any): string {
   return err.stderr?.toString() || err.message || String(err)
 }
 
+function getRepoRoot(): string {
+  return resolve(__dirname, '../../..')
+}
+
+function getPatchFiles(): string[] {
+  const patchDir = join(getRepoRoot(), PATCHES_DIR)
+  if (!existsSync(patchDir)) return []
+  return readdirSync(patchDir)
+    .filter(f => f.endsWith('.patch'))
+    .sort()
+    .map(f => join(patchDir, f))
+}
+
+async function getLatestUpstreamTag(): Promise<string> {
+  const apiUrl = 'https://api.github.com/repos/EKKOLearnAI/hermes-web-ui/tags?per_page=1'
+  const res = await fetch(apiUrl, {
+    headers: { 'User-Agent': 'hermes-web-ui' },
+    signal: AbortSignal.timeout(15_000),
+  })
+  if (!res.ok) throw new Error(`GitHub API error: ${res.status}`)
+  const tags = await res.json() as Array<{ name: string }>
+  if (!tags.length) throw new Error('No tags found in upstream repository')
+  return tags[0].name
+}
+
+function setupUpstreamRemote() {
+  const root = getRepoRoot()
+  try {
+    const remotes = runGit(['remote'], root)
+    if (!remotes.includes('upstream')) {
+      runGit(['remote', 'add', 'upstream', UPSTREAM_REPO_URL], root)
+    }
+  } catch {
+    runGit(['remote', 'add', 'upstream', UPSTREAM_REPO_URL], root)
+  }
+}
+
+function syncWithUpstream(tag: string): { success: boolean; output: string; conflict?: string } {
+  const root = getRepoRoot()
+  const patchFiles = getPatchFiles()
+
+  if (!patchFiles.length) {
+    return { success: false, output: 'No patch files found in packages/hermes-patches/' }
+  }
+
+  setupUpstreamRemote()
+  runGit(['fetch', 'upstream', '--tags'], root)
+
+  let output = `Merging upstream tag: ${tag}\n`
+  try {
+    const mergeResult = runGit(['merge', `upstream/${tag}`, '--no-edit'], root)
+    output += `Merge output: ${mergeResult}\n`
+  } catch (err: any) {
+    return { success: false, output: `Merge failed: ${errorMessage(err)}` }
+  }
+
+  for (const patchFile of patchFiles) {
+    output += `Applying patch: ${patchFile}\n`
+    try {
+      runGit(['am', '--3way', patchFile], root)
+    } catch (err: any) {
+      const conflictMsg = `Conflict in patch ${patchFile}. Please resolve conflicts manually.\nError: ${errorMessage(err)}`
+      return { success: false, output, conflict: conflictMsg }
+    }
+  }
+
+  return { success: true, output }
+}
+
+function buildProject(): string {
+  const root = getRepoRoot()
+  const output = runNpm(['ci', '--ignore-scripts'], { cwd: root, timeout: 10 * 60 * 1000 })
+  const buildOutput = runNpm(['run', 'build'], { cwd: root, timeout: 15 * 60 * 1000 })
+  return output + '\n' + buildOutput
+}
+
 async function downloadGithubZip(ref: string, targetDir: string, type: 'tag' | 'branch' = 'tag') {
   const { owner, repo } = getPreviewGithubRepoParts()
   const refKind = type === 'branch' ? 'heads' : 'tags'
@@ -896,15 +975,70 @@ export async function handleUpdate(ctx: any) {
     return
   }
 
-  updateInProgress = true
+  const patchFiles = getPatchFiles()
+  const hasPatches = patchFiles.length > 0
 
-  try {
-    const output = runUpdateInstall()
+  if (!hasPatches) {
+    updateInProgress = true
+    try {
+      const output = runUpdateInstall()
+      ctx.body = {
+        success: true,
+        message: output.trim() || 'hermes-web-ui updated successfully',
+      }
 
-    ctx.body = {
-      success: true,
-      message: output.trim() || 'hermes-web-ui updated successfully',
+      setTimeout(() => {
+        let restart
+        try {
+          restart = spawnRestart(process.env.PORT || '8648')
+        } catch (err) {
+          updateInProgress = false
+          console.error('[update] failed to spawn restart:', err)
+          return
+        }
+
+        restart.on('error', (err) => {
+          updateInProgress = false
+          console.error('[update] restart process failed:', err)
+        })
+        restart.on('exit', (code, signal) => {
+          updateInProgress = false
+          const failed = (typeof code === 'number' && code !== 0) || Boolean(signal)
+          if (failed) {
+            console.error(`[update] restart process exited before replacing server: code=${code} signal=${signal}`)
+          }
+        })
+        restart.unref()
+      }, 3000)
+    } catch (err: any) {
+      updateInProgress = false
+      ctx.status = 500
+      ctx.body = {
+        success: false,
+        message: err.stderr?.toString() || err.message || String(err),
+      }
     }
+    return
+  }
+
+  updateInProgress = true
+  try {
+    ctx.body = { success: true, message: 'Syncing with upstream...' }
+
+    const latestTag = await getLatestUpstreamTag()
+    const syncResult = syncWithUpstream(latestTag)
+
+    if (!syncResult.success) {
+      updateInProgress = false
+      ctx.status = 500
+      ctx.body = {
+        success: false,
+        message: syncResult.conflict || syncResult.output,
+      }
+      return
+    }
+
+    const buildOutput = buildProject()
 
     setTimeout(() => {
       let restart
@@ -934,7 +1068,7 @@ export async function handleUpdate(ctx: any) {
     ctx.status = 500
     ctx.body = {
       success: false,
-      message: err.stderr?.toString() || err.message || String(err),
+      message: err.message || String(err),
     }
   }
 }
