@@ -21,6 +21,7 @@ const STORAGE_KEY = 'hermes-stt-settings-v1'
 
 function browserSttAvailable(): boolean {
   if (typeof window === 'undefined') return false
+  if (!window.isSecureContext) return false
   const browserWindow = window as Window & {
     SpeechRecognition?: unknown
     webkitSpeechRecognition?: unknown
@@ -45,9 +46,12 @@ const DEFAULT: SttSettingsData = {
 }
 
 function sanitize(data: Partial<SttSettingsData>): SttSettingsData {
-  const provider = data.provider === 'browser' || data.provider === 'openai' || data.provider === 'custom'
+  const providerRaw = data.provider === 'browser' || data.provider === 'openai' || data.provider === 'custom' || data.provider === 'local'
     ? data.provider
     : DEFAULT.provider
+  const provider = providerRaw === 'browser' && typeof window !== 'undefined' && !window.isSecureContext
+    ? DEFAULT.provider
+    : providerRaw
 
   return {
     provider,

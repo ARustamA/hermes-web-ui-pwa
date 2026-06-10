@@ -1369,6 +1369,8 @@ export default {
       presetOpenaiWhisperLabel: 'OpenAI Whisper',
       presetGroqSttLabel: 'Groq STT',
       presetCustomSttLabel: 'Custom STT',
+      presetLocalWhisperLabel: 'Local Whisper',
+      presetLocalWhisperDescription: 'Local faster-whisper via Hermes Agent Bridge.',
       apiCompatibility: 'API compatibility',
       openaiCompatible: 'OpenAI-compatible',
       manualCustomEndpoint: 'Manual custom endpoint',

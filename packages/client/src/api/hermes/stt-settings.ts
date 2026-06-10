@@ -1,6 +1,6 @@
 import { request } from '../client'
 
-export type SttProvider = 'browser' | 'openai' | 'custom'
+export type SttProvider = 'browser' | 'openai' | 'custom' | 'local'
 export type StoredSttProvider = Exclude<SttProvider, 'browser'>
 
 export interface SttStoredSettings {

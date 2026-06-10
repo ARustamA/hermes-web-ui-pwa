@@ -111,4 +111,16 @@ export const VOICE_API_PRESETS: VoiceApiPreset[] = [
       models: true,
     },
   },
+  {
+    id: 'stt-local',
+    kind: 'stt',
+    provider: 'local',
+    label: 'Local Whisper',
+    labelKey: 'settings.voice.presetLocalWhisperLabel',
+    description: 'Local faster-whisper via Hermes Agent Bridge.',
+    descriptionKey: 'settings.voice.presetLocalWhisperDescription',
+    isBuiltin: true,
+    isSecretRequired: false,
+    capabilities: {},
+  },
 ]

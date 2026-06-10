@@ -2464,6 +2464,25 @@ class BridgeServer:
                 "running_session_count": running_sessions,
             }
 
+        if action == "transcribe":
+            audio_path = str(req.get("audio_path") or "").strip()
+            if not audio_path or not os.path.isfile(audio_path):
+                return {"ok": False, "error": "audio_path is required and must exist"}
+            model_name = str(req.get("model") or "medium").strip()
+            try:
+                from faster_whisper import WhisperModel
+                model = WhisperModel(model_name, device="auto", compute_type="auto")
+                segments, info = model.transcribe(audio_path)
+                text = " ".join(seg.text for seg in segments)
+                return {
+                    "ok": True,
+                    "transcript": text,
+                    "language": info.language,
+                    "duration": round(info.duration, 2) if info.duration else None,
+                }
+            except Exception as e:
+                return {"ok": False, "error": f"Transcription failed: {e}"}
+
         if action == "chat":
             session_id = str(req.get("session_id") or "").strip() or uuid.uuid4().hex
             message = req.get("message", req.get("input", ""))

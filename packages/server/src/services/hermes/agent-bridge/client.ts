@@ -69,6 +69,12 @@ export interface AgentBridgeChatStarted extends AgentBridgeResponse {
   status: AgentBridgeStatus
 }
 
+export interface AgentBridgeTranscribeResult extends AgentBridgeResponse {
+  transcript: string
+  language?: string
+  duration?: number
+}
+
 export interface AgentBridgeOutput extends AgentBridgeResponse {
   run_id: string
   session_id: string
@@ -399,6 +405,14 @@ export class AgentBridgeClient {
 
   ping(): Promise<AgentBridgeResponse> {
     return this.request({ action: 'ping' })
+  }
+
+  transcribe(audioPath: string, model?: string): Promise<AgentBridgeTranscribeResult> {
+    return this.request<AgentBridgeTranscribeResult>({
+      action: 'transcribe',
+      audio_path: audioPath,
+      ...(model ? { model } : {}),
+    })
   }
 
   chat(

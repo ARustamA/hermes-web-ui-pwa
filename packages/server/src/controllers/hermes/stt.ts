@@ -306,17 +306,20 @@ export async function transcribe(ctx: Context) {
     return
   }
 
-  const storedSetting = getSttProviderSetting(userId, provider, { includeSecrets: true })
-  if (!storedSetting) {
-    ctx.status = 400
-    ctx.body = { error: `STT settings are required for provider ${provider}` }
-    return
-  }
+  let storedSetting: ReturnType<typeof getSttProviderSetting> | null = null
+  if (provider !== 'local') {
+    storedSetting = getSttProviderSetting(userId, provider, { includeSecrets: true })
+    if (!storedSetting) {
+      ctx.status = 400
+      ctx.body = { error: `STT settings are required for provider ${provider}` }
+      return
+    }
 
-  if (!storedSetting.secrets.apiKey) {
-    ctx.status = 400
-    ctx.body = { error: `STT settings are incomplete for provider ${provider}` }
-    return
+    if (!storedSetting.secrets.apiKey) {
+      ctx.status = 400
+      ctx.body = { error: `STT settings are incomplete for provider ${provider}` }
+      return
+    }
   }
 
   const controller = createRequestAbortController(ctx)
@@ -327,8 +330,8 @@ export async function transcribe(ctx: Context) {
       audio: audio.data,
       fileName: audio.filename || 'audio',
       mimeType: audio.contentType || 'application/octet-stream',
-      settings: storedSetting.settings,
-      secrets: storedSetting.secrets,
+      settings: storedSetting?.settings ?? { model: '', language: '', prompt: '', baseUrl: '' },
+      secrets: storedSetting?.secrets ?? { apiKey: '' },
       signal: controller.signal,
     })
 

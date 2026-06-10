@@ -1037,6 +1037,9 @@ export default {
       edgePitch: 'Тон',
       edgePitchHint: 'Регулировка тона голоса (-20 ~ +20 Гц)',
 
+      presetLocalWhisperLabel: 'Local Whisper',
+      presetLocalWhisperDescription: 'Локальный faster-whisper через Hermes Agent Bridge.',
+
       testTitle: 'Тест голоса',
       testText: 'Тестовый текст',
       testTextPlaceholder: 'Введите текст для теста...',
