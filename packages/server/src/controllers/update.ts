@@ -851,6 +851,16 @@ async function runGitAsync(args: string[], cwd?: string) {
   })
 }
 
+function runGit(args: string[], cwd?: string): string {
+  return execFileSync('git', args, {
+    encoding: 'utf-8',
+    timeout: 5 * 60 * 1000,
+    stdio: ['pipe', 'pipe', 'pipe'],
+    cwd,
+    windowsHide: true,
+  }).trim()
+}
+
 function networkErrorMessage(err: any): string {
   const detail = err.stderr?.toString() || err.message || String(err)
   return `Unable to connect to GitHub. Please check your network or proxy settings. ${detail}`
@@ -860,13 +870,11 @@ function errorMessage(err: any): string {
   return err.stderr?.toString() || err.message || String(err)
 }
 
-<<<<<<< HEAD
 function getRepoRoot(): string {
-  // Try multiple candidate paths to support both dev and production
   const candidates = [
-    resolve(__dirname, '../../..'),   // bundled: dist/server → repo root
-    resolve(__dirname, '../../../..'), // dev: packages/server/src/controllers → repo root
-    resolve(process.cwd()),           // fallback to cwd
+    resolve(__dirname, '../../..'),
+    resolve(__dirname, '../../../..'),
+    resolve(process.cwd()),
   ]
   for (const candidate of candidates) {
     const pkgPath = join(candidate, 'package.json')
@@ -947,7 +955,8 @@ function buildProject(): string {
   const output = runNpm(['ci', '--ignore-scripts'], { cwd: root, timeout: 10 * 60 * 1000 })
   const buildOutput = runNpm(['run', 'build'], { cwd: root, timeout: 15 * 60 * 1000 })
   return output + '\n' + buildOutput
-=======
+}
+
 function queuePreviewAction(
   action: string,
   work: () => Promise<PreviewActionResult | void>,
@@ -987,7 +996,6 @@ function previewActionAlreadyRunning(ctx: any) {
 function previewActionAccepted(ctx: any) {
   ctx.status = 202
   ctx.body = previewPayload({ success: true, accepted: true })
->>>>>>> upstream/main
 }
 
 async function downloadGithubZip(ref: string, targetDir: string, type: 'tag' | 'branch' = 'tag') {
