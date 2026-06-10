@@ -1,5 +1,21 @@
+<script lang="ts">
+type SessionScrollSnapshot = {
+  scrollTop: number;
+  scrollHeight: number;
+  clientHeight: number;
+  wasNearBottom: boolean;
+}
+
+type BottomScrollOptions = number | {
+  frames?: number;
+  keepAliveMs?: number;
+}
+
+const sessionScrollPositions = new Map<string, SessionScrollSnapshot>();
+</script>
+
 <script setup lang="ts">
-import { ref, computed, nextTick, watch } from "vue";
+import { ref, computed, nextTick, onBeforeUnmount, watch } from "vue";
 import { useI18n } from "vue-i18n";
 import VirtualMessageList from "./VirtualMessageList.vue";
 import MessageItem from "./MessageItem.vue";
@@ -14,7 +30,8 @@ const { t } = useI18n();
 const { isDark } = useTheme();
 const { toolTraceVisible } = useToolTraceVisibility();
 const listRef = ref<InstanceType<typeof VirtualMessageList> | null>(null);
-const pendingBottomSessionId = ref<string | null>(null);
+const pendingInitialScrollSessionId = ref<string | null>(null);
+const initialBottomScrollOptions = { frames: 8, keepAliveMs: 1200 };
 
 function formatTokens(n: number): string {
   if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + 'M'
@@ -49,6 +66,30 @@ const visibleToolCalls = computed(() =>
   currentToolCalls.value.filter((tool) => !!tool.toolName),
 );
 
+const emptyState = computed(() => {
+  const session = chatStore.activeSession;
+  const codingAgentId = session?.codingAgentId || (session?.agent === "codex" ? "codex" : session?.agent === "claude" ? "claude-code" : undefined);
+  if (codingAgentId === "codex") {
+    return {
+      logo: "/coding-agents/codex-openai.png",
+      alt: "Codex",
+      text: t("chat.emptyStateAgent", { agent: "Codex" }),
+    };
+  }
+  if (codingAgentId === "claude-code") {
+    return {
+      logo: "/coding-agents/claude-code.svg",
+      alt: "Claude Code",
+      text: t("chat.emptyStateAgent", { agent: "Claude Code" }),
+    };
+  }
+  return {
+    logo: "/logo.png",
+    alt: "Hermes",
+    text: t("chat.emptyState"),
+  };
+});
+
 const displayMessages = computed(() => {
   const currentToolIds = new Set(currentToolCalls.value.map((tool) => tool.id));
   return chatStore.messages.filter((m) => {
@@ -73,6 +114,9 @@ const queuedMessages = computed(() => {
   if (!sid) return [];
   return chatStore.queuedUserMessages.get(sid) || [];
 });
+const virtualListPadding = computed(() => queuedMessages.value.length > 0
+  ? "20px 20px 240px"
+  : "20px");
 
 function removeQueuedMessage(messageId: string) {
   const sid = chatStore.activeSessionId;
@@ -85,12 +129,12 @@ function queuedPreview(content: string): string {
   return normalized.length > 48 ? `${normalized.slice(0, 48)}...` : normalized;
 }
 
-function isNearBottom(threshold = 200): boolean {
-  return listRef.value?.isNearBottom(threshold) ?? true;
+function shouldAutoFollowBottom(threshold = 100): boolean {
+  return listRef.value?.shouldAutoFollowBottom(threshold) ?? true;
 }
 
-function scrollToBottom() {
-  listRef.value?.scrollToBottom();
+function scrollToBottom(options?: BottomScrollOptions) {
+  listRef.value?.scrollToBottom(options);
 }
 
 function scrollToMessage(messageId: string) {
@@ -99,6 +143,37 @@ function scrollToMessage(messageId: string) {
 
 function scrollToAnchor(messageId: string, anchorId: string) {
   listRef.value?.scrollToAnchor(messageId, anchorId);
+}
+
+function saveSessionScrollPosition(sessionId: string | null | undefined) {
+  if (!sessionId) return;
+  const snapshot = listRef.value?.captureViewportPosition() ?? null;
+  if (snapshot) sessionScrollPositions.set(sessionId, snapshot);
+}
+
+function applyInitialSessionScroll(sessionId: string) {
+  if (chatStore.activeSessionId !== sessionId) return;
+  if (chatStore.focusMessageId) {
+    pendingInitialScrollSessionId.value = null;
+    scrollToMessage(chatStore.focusMessageId);
+    return;
+  }
+
+  const snapshot = sessionScrollPositions.get(sessionId);
+  if (snapshot) {
+    pendingInitialScrollSessionId.value = null;
+    if (snapshot.wasNearBottom) {
+      scrollToBottom(initialBottomScrollOptions);
+    } else {
+      listRef.value?.restoreViewportPosition(snapshot);
+    }
+    return;
+  }
+
+  scrollToBottom(initialBottomScrollOptions);
+  if (chatStore.messages.length > 0 && !chatStore.isLoadingMessages) {
+    pendingInitialScrollSessionId.value = null;
+  }
 }
 
 async function handleTopReach() {
@@ -111,17 +186,14 @@ async function handleTopReach() {
   listRef.value?.restoreScrollPosition(snapshot);
 }
 
-// Scroll to bottom on session switch
 watch(
   () => chatStore.activeSessionId,
-  (id) => {
+  async (id, previousId) => {
+    saveSessionScrollPosition(previousId);
     if (!id) return;
-    pendingBottomSessionId.value = id;
-    if (chatStore.focusMessageId) {
-      scrollToMessage(chatStore.focusMessageId);
-      return;
-    }
-    scrollToBottom();
+    pendingInitialScrollSessionId.value = id;
+    await nextTick();
+    applyInitialSessionScroll(id);
   },
   { immediate: true },
 );
@@ -129,13 +201,26 @@ watch(
 watch(
   () => [chatStore.activeSessionId, chatStore.messages.length] as const,
   ([id, length]) => {
-    if (!id || pendingBottomSessionId.value !== id || length === 0) return;
-    pendingBottomSessionId.value = null;
+    if (!id || pendingInitialScrollSessionId.value !== id || length === 0) return;
+    applyInitialSessionScroll(id);
+  },
+  { flush: "post" },
+);
+
+watch(
+  () => chatStore.isLoadingMessages,
+  async (isLoading, wasLoading) => {
+    if (isLoading || !wasLoading) return;
+    const id = chatStore.activeSessionId;
+    if (!id || pendingInitialScrollSessionId.value !== id) return;
     if (chatStore.focusMessageId) {
-      scrollToMessage(chatStore.focusMessageId);
+      pendingInitialScrollSessionId.value = null;
       return;
     }
-    scrollToBottom();
+    await nextTick();
+    if (chatStore.activeSessionId !== id) return;
+    scrollToBottom(initialBottomScrollOptions);
+    pendingInitialScrollSessionId.value = null;
   },
   { flush: "post" },
 );
@@ -152,7 +237,7 @@ watch(
 watch(
   () => chatStore.isRunActive,
   (v) => {
-    if (v) scrollToBottom();
+    if (v) scrollToBottom({ frames: 3, keepAliveMs: 400 });
   },
 );
 
@@ -160,21 +245,40 @@ watch(
 watch(
   () => chatStore.messages[chatStore.messages.length - 1]?.content,
   () => {
+    if (pendingInitialScrollSessionId.value === chatStore.activeSessionId) return;
     if (chatStore.focusMessageId) {
       scrollToMessage(chatStore.focusMessageId);
       return;
     }
-    if (!isNearBottom()) return;
-    scrollToBottom();
+    if (!shouldAutoFollowBottom()) return;
+    scrollToBottom({ frames: 1, keepAliveMs: 0 });
   },
 );
 watch(currentToolCalls, () => {
+  if (pendingInitialScrollSessionId.value === chatStore.activeSessionId) return;
   if (chatStore.focusMessageId) {
     scrollToMessage(chatStore.focusMessageId);
     return;
   }
-  if (!isNearBottom()) return;
-  scrollToBottom();
+  if (!shouldAutoFollowBottom()) return;
+  scrollToBottom({ frames: 1, keepAliveMs: 0 });
+});
+
+watch(
+  () => queuedMessages.value.length,
+  async (length, previousLength) => {
+    if (pendingInitialScrollSessionId.value === chatStore.activeSessionId) return;
+    if (chatStore.focusMessageId) return;
+    if (length <= previousLength) return;
+    const wasNearBottom = shouldAutoFollowBottom(320);
+    await nextTick();
+    if (!wasNearBottom && !chatStore.isRunActive) return;
+    scrollToBottom({ frames: 4, keepAliveMs: 600 });
+  },
+);
+
+onBeforeUnmount(() => {
+  saveSessionScrollPosition(chatStore.activeSessionId);
 });
 
 defineExpose({
@@ -185,195 +289,202 @@ defineExpose({
 </script>
 
 <template>
-  <VirtualMessageList
-    ref="listRef"
-    :messages="displayMessages"
-    @top-reach="handleTopReach"
-  >
-    <template #empty>
-      <div class="empty-state">
-        <img src="/logo.png" alt="Hermes" class="empty-logo" />
-        <p>{{ t("chat.emptyState") }}</p>
-      </div>
-    </template>
-    <template #before>
-      <div
-        v-if="chatStore.activeSession?.hasMoreBefore || chatStore.activeSession?.isLoadingOlderMessages"
-        class="history-loader"
-      >
-        <span v-if="chatStore.activeSession?.isLoadingOlderMessages" class="history-loader-spinner"></span>
-      </div>
-    </template>
-    <template #item="{ message: msg }">
-      <MessageItem
-        :message="msg"
-        :highlight="chatStore.focusMessageId === msg.id"
-      />
-    </template>
-    <template #after>
-      <Transition name="fade">
-      <div v-if="chatStore.isRunActive || chatStore.abortState" class="streaming-indicator">
-        <img
-          :src="isDark ? thinkingImageDark : thinkingImageLight"
-          alt=""
-          aria-hidden="true"
-          class="thinking-video"
+  <div class="message-list-shell">
+    <VirtualMessageList
+      :key="chatStore.activeSessionId || 'chat-empty'"
+      ref="listRef"
+      :messages="displayMessages"
+      :padding="virtualListPadding"
+      @top-reach="handleTopReach"
+    >
+      <template #empty>
+        <div class="empty-state">
+          <img :src="emptyState.logo" :alt="emptyState.alt" class="empty-logo" />
+          <p>{{ emptyState.text }}</p>
+        </div>
+      </template>
+      <template #before>
+        <div
+          v-if="chatStore.activeSession?.hasMoreBefore || chatStore.activeSession?.isLoadingOlderMessages"
+          class="history-loader"
         >
-        <div v-if="visibleToolCalls.length > 0 || chatStore.compressionState || chatStore.abortState" class="tool-calls-panel">
-          <!-- Abort indicator -->
-          <div v-if="chatStore.abortState" class="tool-call-item compression-item">
-            <svg
-              v-if="chatStore.abortState.aborting"
-              width="12"
-              height="12"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              stroke-width="1.5"
-              class="tool-call-icon"
-            >
-              <path d="M10 9v6m4-6v6M5 5h14v14H5z" />
-            </svg>
-            <svg
-              v-else
-              width="12"
-              height="12"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              stroke-width="1.5"
-              class="tool-call-icon"
-            >
-              <path d="M5 13l4 4L19 7" />
-            </svg>
-            <span class="tool-call-name">
-              {{
-                chatStore.abortState.aborting
-                  ? 'Pausing... waiting for the run to stop and sync'
-                  : chatStore.abortState.synced
-                    ? 'Paused and synced'
-                    : 'Paused'
-              }}
-            </span>
-            <span
-              v-if="chatStore.abortState.aborting"
-              class="tool-call-spinner"
-            ></span>
-          </div>
-          <!-- Compression indicator -->
-          <div v-if="chatStore.compressionState" class="tool-call-item compression-item">
-            <svg
-              v-if="chatStore.compressionState.compressing"
-              width="12"
-              height="12"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              stroke-width="1.5"
-              class="tool-call-icon"
-            >
-              <path d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
-            </svg>
-            <svg
-              v-else-if="chatStore.compressionState.compressed"
-              width="12"
-              height="12"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              stroke-width="1.5"
-              class="tool-call-icon"
-            >
-              <path d="M5 13l4 4L19 7" />
-            </svg>
-            <span class="tool-call-name">
-              {{
-                chatStore.compressionState.compressing
-                  ? `Compressing... (${chatStore.compressionState.messageCount} msgs, ~${formatTokens(chatStore.compressionState.beforeTokens)} tokens)`
-                  : chatStore.compressionState.compressed
-                    ? `Compressed ${chatStore.compressionState.messageCount} msgs: ~${formatTokens(chatStore.compressionState.beforeTokens)} → ~${formatTokens(chatStore.compressionState.afterTokens)} tokens`
-                    : `Compression skipped`
-              }}
-            </span>
-            <span
-              v-if="chatStore.compressionState.compressing"
-              class="tool-call-spinner"
-            ></span>
-          </div>
-          <!-- Tool calls -->
-          <div
-            v-for="tc in visibleToolCalls"
-            :key="tc.id"
-            class="tool-call-item"
+          <span v-if="chatStore.activeSession?.isLoadingOlderMessages" class="history-loader-spinner"></span>
+        </div>
+      </template>
+      <template #item="{ message: msg }">
+        <MessageItem
+          :message="msg"
+          :highlight="chatStore.focusMessageId === msg.id"
+        />
+      </template>
+      <template #after>
+        <Transition name="fade">
+        <div v-if="chatStore.isRunActive || chatStore.abortState" class="streaming-indicator">
+          <img
+            :src="isDark ? thinkingImageDark : thinkingImageLight"
+            alt=""
+            aria-hidden="true"
+            class="thinking-video"
           >
-            <svg
-              width="12"
-              height="12"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              stroke-width="1.5"
-              class="tool-call-icon"
-            >
-              <path
-                d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"
-              />
-            </svg>
-            <span class="tool-call-name">{{ tc.toolName }}</span>
-            <span v-if="tc.toolPreview" class="tool-call-preview">{{
-              tc.toolPreview
-            }}</span>
-            <span
-              v-if="tc.toolDuration && tc.toolStatus !== 'running'"
-              class="tool-call-duration"
-              :title="$t('chat.executionDuration')"
-            >{{ formatToolDuration(tc.toolDuration) }}</span
-            >
-            <svg
-              v-if="tc.toolStatus === 'done'"
-              width="16"
-              height="16"
-              viewBox="0 0 24 24"
-              fill="none"
-              class="tool-call-success-icon"
-            >
-              <circle cx="12" cy="12" r="10" fill="currentColor" fill-opacity="0.15"/>
-              <path
-                d="M8 12L11 15L16 9"
-                stroke="currentColor"
-                stroke-width="2"
-                stroke-linecap="round"
-                stroke-linejoin="round"
+          <div v-if="visibleToolCalls.length > 0 || chatStore.compressionState || chatStore.abortState" class="tool-calls-panel">
+            <!-- Abort indicator -->
+            <div v-if="chatStore.abortState" class="tool-call-item compression-item">
+              <svg
+                v-if="chatStore.abortState.aborting"
+                width="12"
+                height="12"
+                viewBox="0 0 24 24"
                 fill="none"
-              />
-            </svg>
-            <span
-              v-if="tc.toolStatus === 'running'"
-              class="tool-call-spinner"
-            ></span>
-            <svg
-              v-if="tc.toolStatus === 'error'"
-              width="16"
-              height="16"
-              viewBox="0 0 24 24"
-              fill="none"
-              class="tool-call-error-icon"
-            >
-              <circle cx="12" cy="12" r="10" fill="currentColor" fill-opacity="0.15"/>
-              <path
-                d="M15 9L9 15M9 9L15 15"
                 stroke="currentColor"
-                stroke-width="2"
-                stroke-linecap="round"
-                stroke-linejoin="round"
+                stroke-width="1.5"
+                class="tool-call-icon"
+              >
+                <path d="M10 9v6m4-6v6M5 5h14v14H5z" />
+              </svg>
+              <svg
+                v-else
+                width="12"
+                height="12"
+                viewBox="0 0 24 24"
                 fill="none"
-              />
-            </svg>
+                stroke="currentColor"
+                stroke-width="1.5"
+                class="tool-call-icon"
+              >
+                <path d="M5 13l4 4L19 7" />
+              </svg>
+              <span class="tool-call-name">
+                {{
+                  chatStore.abortState.aborting
+                    ? chatStore.abortState.timedOut
+                      ? (chatStore.abortState.message || 'Still stopping... new messages will be queued')
+                      : 'Pausing... waiting for the run to stop and sync'
+                    : chatStore.abortState.synced
+                      ? 'Paused and synced'
+                      : 'Paused'
+                }}
+              </span>
+              <span
+                v-if="chatStore.abortState.aborting"
+                class="tool-call-spinner"
+              ></span>
+            </div>
+            <!-- Compression indicator -->
+            <div v-if="chatStore.compressionState" class="tool-call-item compression-item">
+              <svg
+                v-if="chatStore.compressionState.compressing"
+                width="12"
+                height="12"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.5"
+                class="tool-call-icon"
+              >
+                <path d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+              </svg>
+              <svg
+                v-else-if="chatStore.compressionState.compressed"
+                width="12"
+                height="12"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.5"
+                class="tool-call-icon"
+              >
+                <path d="M5 13l4 4L19 7" />
+              </svg>
+              <span class="tool-call-name">
+                {{
+                  chatStore.compressionState.compressing
+                    ? `Compressing... (${chatStore.compressionState.messageCount} msgs, ~${formatTokens(chatStore.compressionState.beforeTokens)} tokens)`
+                    : chatStore.compressionState.compressed
+                      ? `Compressed ${chatStore.compressionState.messageCount} msgs: ~${formatTokens(chatStore.compressionState.beforeTokens)} → ~${formatTokens(chatStore.compressionState.afterTokens)} tokens`
+                      : `Compression skipped`
+                }}
+              </span>
+              <span
+                v-if="chatStore.compressionState.compressing"
+                class="tool-call-spinner"
+              ></span>
+            </div>
+            <!-- Tool calls -->
+            <div
+              v-for="tc in visibleToolCalls"
+              :key="tc.id"
+              class="tool-call-item"
+            >
+              <svg
+                width="12"
+                height="12"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.5"
+                class="tool-call-icon"
+              >
+                <path
+                  d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"
+                />
+              </svg>
+              <span class="tool-call-name">{{ tc.toolName }}</span>
+              <span v-if="tc.toolPreview" class="tool-call-preview">{{
+                tc.toolPreview
+              }}</span>
+              <span
+                v-if="tc.toolDuration && tc.toolStatus !== 'running'"
+                class="tool-call-duration"
+                :title="$t('chat.executionDuration')"
+              >{{ formatToolDuration(tc.toolDuration) }}</span
+              >
+              <svg
+                v-if="tc.toolStatus === 'done'"
+                width="16"
+                height="16"
+                viewBox="0 0 24 24"
+                fill="none"
+                class="tool-call-success-icon"
+              >
+                <circle cx="12" cy="12" r="10" fill="currentColor" fill-opacity="0.15"/>
+                <path
+                  d="M8 12L11 15L16 9"
+                  stroke="currentColor"
+                  stroke-width="2"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  fill="none"
+                />
+              </svg>
+              <span
+                v-if="tc.toolStatus === 'running'"
+                class="tool-call-spinner"
+              ></span>
+              <svg
+                v-if="tc.toolStatus === 'error'"
+                width="16"
+                height="16"
+                viewBox="0 0 24 24"
+                fill="none"
+                class="tool-call-error-icon"
+              >
+                <circle cx="12" cy="12" r="10" fill="currentColor" fill-opacity="0.15"/>
+                <path
+                  d="M15 9L9 15M9 9L15 15"
+                  stroke="currentColor"
+                  stroke-width="2"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  fill="none"
+                />
+              </svg>
+            </div>
           </div>
         </div>
-      </div>
-      </Transition>
-      <Transition name="queue-float">
+        </Transition>
+      </template>
+    </VirtualMessageList>
+    <Transition name="queue-float">
       <div v-if="queuedMessages.length > 0" class="queue-float-panel">
         <div class="queue-float-header">
           <span class="queue-orbit" aria-hidden="true">
@@ -404,22 +515,26 @@ defineExpose({
           </div>
         </div>
       </div>
-      </Transition>
-    </template>
-  </VirtualMessageList>
+    </Transition>
+  </div>
 </template>
 
 <style scoped lang="scss">
 @use "@/styles/variables" as *;
 
+.message-list-shell {
+  flex: 1;
+  min-height: 0;
+  position: relative;
+  display: flex;
+}
+
 .queue-float-panel {
-  position: sticky;
+  position: absolute;
   right: 16px;
   bottom: 16px;
-  z-index: 4;
+  z-index: 8;
   width: min(340px, calc(100% - 16px));
-  margin-top: 16px;
-  margin-left: auto;
   padding: 10px;
   border: 1px solid rgba(var(--accent-info-rgb), 0.22);
   border-radius: 16px;

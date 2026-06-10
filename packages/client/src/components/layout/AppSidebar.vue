@@ -8,11 +8,12 @@ import ModelSelector from "./ModelSelector.vue";
 import ProfileSelector from "./ProfileSelector.vue";
 import LanguageSwitch from "./LanguageSwitch.vue";
 import ThemeSwitch from "./ThemeSwitch.vue";
+import VersionManagementModal from './VersionManagementModal.vue'
 import { useSessionSearch } from '@/composables/useSessionSearch'
 import { usePersistentRecord } from '@/composables/usePersistentRecord'
 import RouteLinkItem from '@/components/common/RouteLinkItem.vue'
 import { changelog } from "@/data/changelog";
-import { isStoredSuperAdmin } from "@/api/client";
+import { isStoredSuperAdmin, getStoredUsername } from "@/api/client";
 
 const { t } = useI18n();
 const message = useMessage();
@@ -27,7 +28,12 @@ const selectedKey = computed(() => {
   return route.name as string;
 });
 const isSuperAdmin = computed(() => isStoredSuperAdmin());
+const currentUsername = computed(() => getStoredUsername());
 const isVersionPreview = import.meta.env.VITE_HERMES_PREVIEW === '1';
+const isDesktopShell = computed(() => {
+  return typeof window !== 'undefined' &&
+    (window as typeof window & { hermesDesktop?: { isDesktop?: boolean } }).hermesDesktop?.isDesktop === true;
+});
 
 function isNavActive(...names: string[]) {
   return names.includes(selectedKey.value);
@@ -70,22 +76,27 @@ function handleReloadClient() {
 
 function handleLogout() {
   localStorage.clear();
-  router.replace({ name: 'login' });
+  window.location.reload();
 }
 
 // Changelog
 const showChangelog = ref(false);
+const showVersionManagement = ref(false);
 
 function openChangelog() {
   showChangelog.value = true;
+}
+
+function openVersionManagement() {
+  showVersionManagement.value = true;
 }
 </script>
 
 <template>
   <aside class="sidebar" :class="{ open: appStore.sidebarOpen, collapsed: appStore.sidebarCollapsed }">
     <RouteLinkItem class="sidebar-logo" :to="{ name: 'hermes.chat' }">
-      <img :src="logoPath" alt="Hermes" class="logo-img" />
-      <span class="logo-text">Hermes</span>
+      <img :src="logoPath" alt="Hermes Studio" class="logo-img" />
+      <span class="logo-text">Hermes Studio</span>
       <!-- <video class="logo-dance" :src="isDark ? danceVideoDark : danceVideoLight" autoplay loop muted playsinline /> -->
     </RouteLinkItem>
 
@@ -294,6 +305,16 @@ function openChangelog() {
             </svg>
             <span>{{ t("sidebar.versionPreview") }}</span>
           </RouteLinkItem>
+          <RouteLinkItem class="nav-item" :to="{ name: 'hermes.devices' }" :active="selectedKey === 'hermes.devices'">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="3" y="4" width="18" height="12" rx="2" />
+              <path d="M8 20h8" />
+              <path d="M12 16v4" />
+              <path d="M6 8h.01" />
+              <path d="M10 8h.01" />
+            </svg>
+            <span>{{ t("sidebar.devices") }}</span>
+          </RouteLinkItem>
         </div>
       </div>
 
@@ -335,6 +356,7 @@ function openChangelog() {
           <line x1="21" y1="12" x2="9" y2="12" />
         </svg>
         <span>{{ t("sidebar.logout") }}</span>
+        <span v-if="currentUsername" class="logout-username" :title="currentUsername">{{ currentUsername }}</span>
       </button>
       <div class="status-row">
         <div
@@ -358,13 +380,16 @@ function openChangelog() {
           <a class="github-link" href="https://github.com/EKKOLearnAI/hermes-web-ui" target="_blank" rel="noopener noreferrer" title="GitHub">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0024 12c0-6.63-5.37-12-12-12z"/></svg>
           </a>
-          <a class="website-link" href="https://ekkolearnai.com/" target="_blank" rel="noopener noreferrer" title="Website">
+          <a class="website-link" href="https://hermes-studio.ai/" target="_blank" rel="noopener noreferrer" title="Website">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
           </a>
         </div>
-        <span class="version-text" @click="openChangelog">Web UI v{{ appStore.serverVersion || "0.1.0" }}</span>
+        <span class="version-text" @click="openChangelog">Studio v{{ appStore.serverVersion || "0.1.0" }}</span>
         <ThemeSwitch />
       </div>
+      <NButton v-if="isDesktopShell" type="primary" size="tiny" block class="update-btn" @click="openVersionManagement">
+        {{ t('sidebar.versionManagement') }}
+      </NButton>
       <NButton v-if="appStore.clientOutdated" type="warning" size="tiny" block class="update-btn" @click="handleReloadClient">
         {{ t('sidebar.reloadClientVersion', { version: appStore.serverVersion }) }}
       </NButton>
@@ -387,6 +412,7 @@ function openChangelog() {
         </div>
       </div>
     </NModal>
+    <VersionManagementModal v-if="isDesktopShell" v-model:show="showVersionManagement" />
   </aside>
 </template>
 
@@ -431,9 +457,10 @@ function openChangelog() {
   overflow: hidden;
 
   .logo-text {
-    font-size: 18px;
+    font-size: 16px;
     font-weight: 600;
     letter-spacing: 0.5px;
+    white-space: nowrap;
   }
 
   .logo-dance {
@@ -567,9 +594,28 @@ function openChangelog() {
   font-size: 13px;
   color: $text-muted;
 
+  > svg,
+  > span:not(.logout-username) {
+    flex-shrink: 0;
+  }
+
   &:hover {
     color: $error;
     background: rgba(var(--error-rgb, 239, 68, 68), 0.06);
+  }
+
+  .logout-username {
+    margin-left: auto;
+    width: 96px;
+    min-width: 0;
+    max-width: 40%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    text-align: right;
+    flex: 0 1 96px;
+    font-size: 12px;
+    color: $text-muted;
   }
 }
 
@@ -660,7 +706,7 @@ function openChangelog() {
 }
 
 .changelog-list {
-  max-height: 400px;
+  max-height: min(70vh, 640px);
   overflow-y: auto;
 }
 

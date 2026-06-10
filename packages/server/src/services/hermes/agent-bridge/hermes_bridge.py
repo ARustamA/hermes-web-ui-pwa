@@ -10,6 +10,7 @@ delimited JSON request/response protocol over a local socket.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import atexit
 import copy
 import errno
@@ -65,6 +66,109 @@ def _positive_int(value: str | None) -> int | None:
     return parsed if parsed > 0 else None
 
 
+def _title_user_message(message: Any) -> str:
+    if isinstance(message, list):
+        parts: list[str] = []
+        for block in message:
+            if isinstance(block, dict):
+                if block.get("type") == "text":
+                    parts.append(str(block.get("text") or ""))
+                elif block.get("name"):
+                    parts.append(str(block.get("name") or ""))
+            else:
+                parts.append(str(block))
+        text = "\n".join(part for part in parts if part).strip()
+    else:
+        text = str(message or "").strip()
+    if not text:
+        return ""
+    return (
+        f"{text}\n\n"
+        "[Title language: use the same language as the user's message. "
+        "Do not translate the title to English unless the user's message is English.]"
+    )
+
+
+def _hidden_subprocess_kwargs() -> dict[str, Any]:
+    if os.name != "nt":
+        return {}
+    if os.environ.get("HERMES_DESKTOP", "").strip().lower() != "true":
+        return {}
+    create_no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0) or 0x08000000
+    kwargs: dict[str, Any] = {"creationflags": create_no_window}
+    try:
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= getattr(subprocess, "STARTF_USESHOWWINDOW", 1)
+        startupinfo.wShowWindow = getattr(subprocess, "SW_HIDE", 0)
+        kwargs["startupinfo"] = startupinfo
+    except Exception:
+        pass
+    return kwargs
+
+
+def _add_hidden_process_options(kwargs: dict[str, Any], create_no_window: int) -> None:
+    flags = kwargs.get("creationflags", 0) or 0
+    try:
+        kwargs["creationflags"] = int(flags) | create_no_window
+    except Exception:
+        kwargs["creationflags"] = create_no_window
+
+    startupinfo = kwargs.get("startupinfo")
+    if startupinfo is None:
+        try:
+            startupinfo = subprocess.STARTUPINFO()
+        except Exception:
+            return
+        kwargs["startupinfo"] = startupinfo
+    try:
+        startupinfo.dwFlags |= getattr(subprocess, "STARTF_USESHOWWINDOW", 1)
+        startupinfo.wShowWindow = getattr(subprocess, "SW_HIDE", 0)
+    except Exception:
+        pass
+
+
+def _install_windows_hidden_subprocess_defaults() -> None:
+    """Hide console windows for subprocesses launched inside desktop bridge runs.
+
+    The desktop bridge itself must keep stdout/stderr pipes for readiness and
+    worker handshakes, so it runs under python.exe. On Windows that means any
+    nested console executable, including git.exe from context expansion, can
+    flash a window unless the child process is created with CREATE_NO_WINDOW.
+    """
+    if os.name != "nt":
+        return
+    if os.environ.get("HERMES_DESKTOP", "").strip().lower() != "true":
+        return
+    if getattr(subprocess, "_hermes_hidden_defaults_installed", False):
+        return
+
+    original_popen = subprocess.Popen
+    original_create_subprocess_exec = asyncio.create_subprocess_exec
+    original_create_subprocess_shell = asyncio.create_subprocess_shell
+    create_no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0) or 0x08000000
+
+    class HiddenPopen(original_popen):  # type: ignore[misc, valid-type]
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            _add_hidden_process_options(kwargs, create_no_window)
+            super().__init__(*args, **kwargs)
+
+    async def hidden_create_subprocess_exec(*args: Any, **kwargs: Any) -> Any:
+        _add_hidden_process_options(kwargs, create_no_window)
+        return await original_create_subprocess_exec(*args, **kwargs)
+
+    async def hidden_create_subprocess_shell(*args: Any, **kwargs: Any) -> Any:
+        _add_hidden_process_options(kwargs, create_no_window)
+        return await original_create_subprocess_shell(*args, **kwargs)
+
+    subprocess.Popen = HiddenPopen  # type: ignore[assignment]
+    asyncio.create_subprocess_exec = hidden_create_subprocess_exec  # type: ignore[assignment]
+    asyncio.create_subprocess_shell = hidden_create_subprocess_shell  # type: ignore[assignment]
+    subprocess._hermes_hidden_defaults_installed = True  # type: ignore[attr-defined]
+
+
+_install_windows_hidden_subprocess_defaults()
+
+
 def _process_exists(pid: int) -> bool:
     if pid <= 0:
         return False
@@ -75,7 +179,10 @@ def _process_exists(pid: int) -> bool:
                 check=False,
                 capture_output=True,
                 text=True,
+                encoding=_platform_text_encoding(),
+                errors="ignore",
                 timeout=5,
+                **_hidden_subprocess_kwargs(),
             )
             return str(pid) in (result.stdout or "")
         except Exception:
@@ -610,6 +717,78 @@ def _refresh_terminal_env() -> None:
         )
 
 
+def _refresh_approval_allowlist() -> None:
+    """Reload command_allowlist into tools.approval's process-local cache."""
+    try:
+        from tools.approval import load_permanent_allowlist
+
+        load_permanent_allowlist()
+    except Exception:
+        pass
+
+
+def _install_execute_code_approval_memory_patch() -> None:
+    """Let bridge-scoped execute_code approvals honor session/permanent choices.
+
+    Hermes Agent intentionally treats execute_code approvals as one-shot in
+    gateway/ask mode.  Web UI keeps HERMES_EXEC_ASK enabled so dangerous
+    terminal commands still require approval, but users expect the visible
+    Session/Always choices to suppress later execute_code prompts as well.  Keep
+    this compatibility layer in the bridge so the upstream runtime stays
+    untouched.
+    """
+    try:
+        import tools.approval as approval
+
+        original = getattr(approval, "check_execute_code_guard", None)
+        if not callable(original) or getattr(original, "_hermes_web_ui_memory_patch", False):
+            return
+
+        def patched_check_execute_code_guard(code: str, env_type: str) -> dict[str, Any]:
+            try:
+                session_key = approval.get_current_session_key(default="")
+                if session_key and approval.is_approved(session_key, "execute_code"):
+                    return {"approved": True, "message": None}
+            except Exception:
+                pass
+            return original(code, env_type)
+
+        setattr(patched_check_execute_code_guard, "_hermes_web_ui_memory_patch", True)
+        setattr(patched_check_execute_code_guard, "_hermes_web_ui_original", original)
+        approval.check_execute_code_guard = patched_check_execute_code_guard
+    except Exception:
+        pass
+
+
+def _approval_pattern_keys(approval_data: dict[str, Any]) -> list[str]:
+    raw = approval_data.get("pattern_keys")
+    values = raw if isinstance(raw, list) else [approval_data.get("pattern_key")]
+    result: list[str] = []
+    for value in values:
+        key = str(value or "").strip()
+        if key and key not in result:
+            result.append(key)
+    return result
+
+
+def _persist_execute_code_approval_choice(session_id: str, pattern_keys: list[str], choice: str) -> None:
+    if "execute_code" not in pattern_keys or choice not in {"session", "always"}:
+        return
+    try:
+        from tools.approval import approve_permanent, approve_session, load_permanent_allowlist, save_permanent_allowlist
+        import tools.approval as approval
+
+        approve_session(session_id, "execute_code")
+        if choice == "always":
+            approve_permanent("execute_code")
+            permanent = getattr(approval, "_permanent_approved", None)
+            patterns = set(permanent) if isinstance(permanent, set) else set(load_permanent_allowlist())
+            patterns.add("execute_code")
+            save_permanent_allowlist(patterns)
+    except Exception:
+        pass
+
+
 def _resolve_model(cfg: dict[str, Any]) -> str:
     env_model = (
         os.environ.get("HERMES_MODEL", "")
@@ -834,6 +1013,7 @@ class AgentPool:
         self._db = SessionDbHolder()
         self._approval_requests: dict[str, queue.Queue[str]] = {}
         self._gateway_approval_requests: dict[str, str] = {}
+        self._gateway_approval_pattern_keys: dict[str, list[str]] = {}
         self._compression_requests: dict[str, queue.Queue[dict[str, Any]]] = {}
         self._clarify_requests: dict[str, queue.Queue[str]] = {}
         self._run_context = threading.local()
@@ -875,6 +1055,7 @@ class AgentPool:
 
             with _profile_env(profile):
                 _refresh_worker_profile_env()
+                _refresh_approval_allowlist()
                 discovered_mcp_tools = _discover_bridge_mcp_tools()
                 cfg = _load_cfg()
                 resolved_model = requested_model or _resolve_model(cfg)
@@ -904,6 +1085,7 @@ class AgentPool:
                     status_callback=self._status_callback(session_id),
                     thinking_callback=self._make_thinking_callback(session_id),
                     reasoning_callback=self._text_event_callback(session_id, "reasoning.delta"),
+                    stream_delta_callback=self._stream_delta_callback(session_id),
                     tool_progress_callback=self._tool_progress_callback(session_id),
                     tool_start_callback=self._tool_start_callback(session_id),
                     tool_complete_callback=self._tool_complete_callback(session_id),
@@ -1270,11 +1452,9 @@ class AgentPool:
                     "event": "turn.boundary",
                 })
                 return
-            if delta:
-                self._append_event(session_id, {
-                    "event": "stream.delta",
-                    "delta": str(delta),
-                })
+            # Text deltas are already captured by the per-run stream_callback
+            # passed to run_conversation.  Only consume boundary signals here
+            # so registering this callback does not duplicate assistant text.
 
         return callback
 
@@ -1376,13 +1556,16 @@ class AgentPool:
         def callback(approval_data: dict[str, Any]) -> None:
             approval_id = uuid.uuid4().hex
             choices = ["once", "session", "always", "deny"]
+            pattern_keys = _approval_pattern_keys(approval_data)
             with self._lock:
                 self._gateway_approval_requests[approval_id] = session_id
+                self._gateway_approval_pattern_keys[approval_id] = pattern_keys
             self._append_event(session_id, {
                 "event": "approval.requested",
                 "approval_id": approval_id,
                 "command": str(approval_data.get("command") or ""),
                 "description": str(approval_data.get("description") or ""),
+                "pattern_keys": pattern_keys,
                 "choices": choices,
                 "allow_permanent": True,
                 "timeout_ms": 300_000,
@@ -1469,7 +1652,7 @@ class AgentPool:
             return
 
         after_count = self._session_db_message_count(session.session_id, profile)
-        if after_count is None or after_count > db_count_after_prepersist:
+        if after_count is None:
             return
 
         messages = result.get("messages")
@@ -1483,6 +1666,11 @@ class AgentPool:
         ]
         if not generated:
             return
+
+        already_persisted = max(0, after_count - db_count_after_prepersist)
+        if already_persisted >= len(generated):
+            return
+        generated = generated[already_persisted:]
 
         appended = 0
         for msg in generated:
@@ -1513,6 +1701,15 @@ class AgentPool:
                 flush=True,
             )
 
+    def _result_from_agent_messages_for_sync(self, session: AgentSession) -> dict[str, Any] | None:
+        for attr in ("messages", "_messages", "_session_messages"):
+            messages = getattr(session.agent, attr, None)
+            if isinstance(messages, list):
+                return {"messages": copy.deepcopy(messages)}
+        if isinstance(session.history, list) and session.history:
+            return {"messages": copy.deepcopy(session.history)}
+        return None
+
     def start_chat(
         self,
         session_id: str,
@@ -1525,6 +1722,7 @@ class AgentPool:
         model: str | None = None,
         provider: str | None = None,
         source: str | None = None,
+        reasoning_effort: str | None = None,
     ) -> RunRecord:
         session = self.get_or_create(session_id, profile=profile, model=model, provider=provider)
         with session.lock:
@@ -1543,15 +1741,17 @@ class AgentPool:
 
         thread = threading.Thread(
             target=self._run_chat,
-            args=(session, record, message, storage_message, instructions, conversation_history, profile, force_compress, source),
+            args=(session, record, message, storage_message, instructions, conversation_history, profile, force_compress, source, reasoning_effort),
             daemon=True,
             name=f"hermes-bridge-run-{run_id[:8]}",
         )
         thread.start()
         return record
 
-    def _run_chat(self, session: AgentSession, record: RunRecord, message: Any, storage_message: Any | None = None, instructions: str | None = None, conversation_history: list[dict[str, Any]] | None = None, profile: str | None = None, force_compress: bool = False, source: str | None = None) -> None:
+    def _run_chat(self, session: AgentSession, record: RunRecord, message: Any, storage_message: Any | None = None, instructions: str | None = None, conversation_history: list[dict[str, Any]] | None = None, profile: str | None = None, force_compress: bool = False, source: str | None = None, reasoning_effort: str | None = None) -> None:
         with _profile_env(profile):
+            _refresh_approval_allowlist()
+            _install_execute_code_approval_memory_patch()
             def stream_callback(delta: str) -> None:
                 with self._lock:
                     text = str(delta)
@@ -1572,6 +1772,9 @@ class AgentPool:
             approval_session_token = None
             registered_gateway_approval_session = None
             exec_ask_scope_entered = False
+            db_count_after_prepersist: int | None = None
+            result_for_tail_sync: dict[str, Any] | None = None
+            tail_synced = False
             try:
                 try:
                     self._enter_exec_ask_scope()
@@ -1613,11 +1816,33 @@ class AgentPool:
                     kwargs["system_message"] = instructions
                 if conversation_history is not None:
                     kwargs["conversation_history"] = conversation_history
-                result = session.agent.run_conversation(
-                    message,
-                    **kwargs,
-                )
+                # Local patch (reasoning-effort): per-run reasoning effort override (Web UI brain button).
+                # Mutates session.agent.reasoning_config in place — restored after run.
+                _saved_reasoning_config = None
+                _did_override_reasoning = False
+                if reasoning_effort:
+                    try:
+                        from hermes_constants import parse_reasoning_effort
+                        override_cfg = parse_reasoning_effort(str(reasoning_effort).strip())
+                        # parse_reasoning_effort returns None for invalid input; only
+                        # override when we got a recognized value.
+                        if override_cfg is not None:
+                            _saved_reasoning_config = getattr(session.agent, "reasoning_config", None)
+                            session.agent.reasoning_config = override_cfg
+                            _did_override_reasoning = True
+                    except Exception:
+                        # Non-fatal: fall through to default reasoning_config
+                        pass
+                try:
+                    result = session.agent.run_conversation(
+                        message,
+                        **kwargs,
+                    )
+                finally:
+                    if _did_override_reasoning:
+                        session.agent.reasoning_config = _saved_reasoning_config
                 result = _jsonable(result if isinstance(result, dict) else {"value": result})
+                result_for_tail_sync = result
                 self._sync_result_tail_to_session_db(
                     session,
                     result,
@@ -1625,6 +1850,48 @@ class AgentPool:
                     profile,
                     db_count_after_prepersist,
                 )
+                tail_synced = True
+                final_response = str(
+                    result.get("final_response")
+                    or result.get("response")
+                    or result.get("output")
+                    or "".join(record.deltas)
+                    or ""
+                ).strip()
+                title_db = self._db.get_for_profile(profile)
+                if title_db is not None and final_response and not result.get("failed") and not result.get("partial"):
+                    try:
+                        from agent.title_generator import maybe_auto_title
+
+                        def title_callback(title: str) -> None:
+                            cleaned = str(title or "").strip()
+                            if not cleaned:
+                                return
+                            with self._lock:
+                                record.events.append(_jsonable({
+                                    "event": "session.title.updated",
+                                    "session_id": session.session_id,
+                                    "title": cleaned,
+                                }))
+
+                        maybe_auto_title(
+                            title_db,
+                            session.session_id,
+                            _title_user_message(message),
+                            final_response,
+                            result.get("messages", []) if isinstance(result.get("messages"), list) else [],
+                            failure_callback=getattr(session.agent, "_emit_auxiliary_failure", None),
+                            main_runtime={
+                                "model": getattr(session.agent, "model", None),
+                                "provider": getattr(session.agent, "provider", None),
+                                "base_url": getattr(session.agent, "base_url", None),
+                                "api_key": getattr(session.agent, "api_key", None),
+                                "api_mode": getattr(session.agent, "api_mode", None),
+                            },
+                            title_callback=title_callback,
+                        )
+                    except Exception:
+                        pass
                 with session.lock:
                     if isinstance(result.get("messages"), list):
                         session.history = result["messages"]
@@ -1635,6 +1902,19 @@ class AgentPool:
                     session.current_run_id = None
                     session.last_used_at = time.time()
             except Exception as exc:
+                if not tail_synced:
+                    try:
+                        fallback_result = result_for_tail_sync or self._result_from_agent_messages_for_sync(session)
+                        if fallback_result is not None:
+                            self._sync_result_tail_to_session_db(
+                                session,
+                                fallback_result,
+                                conversation_history,
+                                profile,
+                                db_count_after_prepersist,
+                            )
+                    except Exception:
+                        pass
                 with session.lock:
                     record.status = "error"
                     record.error = str(exc)
@@ -1699,6 +1979,7 @@ class AgentPool:
         if response_queue is None:
             with self._lock:
                 gateway_session_id = self._gateway_approval_requests.pop(approval_id, None)
+                pattern_keys = self._gateway_approval_pattern_keys.pop(approval_id, [])
             if gateway_session_id is None:
                 return {"approval_id": approval_id, "resolved": False, "choice": cleaned}
             try:
@@ -1707,6 +1988,8 @@ class AgentPool:
                 resolved = resolve_gateway_approval(gateway_session_id, cleaned) > 0
             except Exception:
                 resolved = False
+            if resolved:
+                _persist_execute_code_approval_choice(gateway_session_id, pattern_keys, cleaned)
             self._append_event(gateway_session_id, {
                 "event": "approval.resolved",
                 "approval_id": approval_id,
@@ -1737,6 +2020,18 @@ class AgentPool:
             raise KeyError(f"unknown session: {session_id}")
         with session.lock:
             return {"session_id": session_id, "history": copy.deepcopy(session.history)}
+
+    def get_session_title(self, session_id: str, profile: str | None = None) -> dict[str, Any]:
+        if not session_id:
+            raise ValueError("session_id is required")
+        db = self._db.get_for_profile(profile)
+        title = None
+        if db is not None and hasattr(db, "get_session_title"):
+            try:
+                title = db.get_session_title(session_id)
+            except Exception:
+                title = None
+        return {"session_id": session_id, "title": str(title or "")}
 
     def dispatch_command(self, session_id: str, command: str, profile: str | None = None) -> dict[str, Any]:
         raw = str(command or "").strip()
@@ -2179,6 +2474,8 @@ class BridgeServer:
             model = req.get("model")
             provider = req.get("provider")
             source = req.get("source")
+            # Local patch (reasoning-effort): per-session reasoning effort override (Web UI brain button).
+            reasoning_effort = req.get("reasoning_effort")
             record = self.pool.start_chat(
                 session_id,
                 message,
@@ -2190,6 +2487,7 @@ class BridgeServer:
                 model,
                 provider,
                 source,
+                reasoning_effort,
             )
             if req.get("wait"):
                 timeout = float(req.get("timeout", 0) or 0)
@@ -2263,6 +2561,12 @@ class BridgeServer:
 
         if action == "get_history":
             return self.pool.get_history(str(req.get("session_id") or ""))
+
+        if action == "get_session_title":
+            return self.pool.get_session_title(
+                str(req.get("session_id") or ""),
+                req.get("profile"),
+            )
 
         if action == "command":
             session_id = str(req.get("session_id") or "").strip()
@@ -2427,16 +2731,18 @@ class BridgeServer:
             cfg = getattr(task, "_config", {})
             # Build filtered tool_details (name + description) for card display
             srv_cfg = mcp_configs.get(name, {}) if isinstance(mcp_configs.get(name), dict) else {}
-            tools_filter = srv_cfg.get("tools") or {}
+            tools_filter = srv_cfg.get("tools") if isinstance(srv_cfg.get("tools"), dict) else {}
+            has_include_filter = "include" in tools_filter
+            has_exclude_filter = "exclude" in tools_filter
             include_set = set(tools_filter.get("include") or [])
             exclude_set = set(tools_filter.get("exclude") or [])
             tool_details = []
             try:
                 for mcp_tool in getattr(task, "_tools", []):
                     tname = getattr(mcp_tool, "name", "?")
-                    if include_set and tname not in include_set:
+                    if has_include_filter and tname not in include_set:
                         continue
-                    if exclude_set and tname in exclude_set:
+                    if has_exclude_filter and tname in exclude_set:
                         continue
                     tool_details.append({
                         "name": tname,
@@ -2576,6 +2882,7 @@ class BridgeServer:
 
     def _mcp_tools_list(self, req: dict, profile: str, _servers, _lock) -> dict[str, Any]:
         server_filter = str(req.get("server") or "").strip() or None
+        raw_mode = bool(req.get("raw"))  # Return unfiltered tools for visibility management
         results = []
 
         config = self._read_mcp_config(profile)
@@ -2592,13 +2899,17 @@ class BridgeServer:
             registered = set(getattr(task, "_registered_tool_names", None) or [])
             tools = []
             srv_cfg = mcp_configs.get(sname, {}) if isinstance(mcp_configs.get(sname), dict) else {}
-            tools_filter = srv_cfg.get("tools") or {}
+            tools_filter = srv_cfg.get("tools") if isinstance(srv_cfg.get("tools"), dict) else {}
+            has_include_filter = "include" in tools_filter
+            has_exclude_filter = "exclude" in tools_filter
             include_set = set(tools_filter.get("include") or [])
             exclude_set = set(tools_filter.get("exclude") or [])
             def _should_include(tn):
-                if include_set:
+                if raw_mode:
+                    return True  # Skip filter in raw mode
+                if has_include_filter:
                     return tn in include_set
-                if exclude_set:
+                if has_exclude_filter:
                     return tn not in exclude_set
                 return True
             try:
@@ -2777,7 +3088,10 @@ class WorkerProcess:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 bufsize=1,
+                **_hidden_subprocess_kwargs(),
             )
             self._pipe_stderr()
             self._wait_ready()
@@ -2950,6 +3264,7 @@ def _windows_listening_pids_on_port(port: int) -> list[int]:
             encoding=_platform_text_encoding(),
             errors="ignore",
             timeout=5,
+            **_hidden_subprocess_kwargs(),
         )
     except Exception:
         return []
@@ -2991,7 +3306,10 @@ def _kill_windows_endpoint_occupants(endpoint: str) -> None:
                 check=False,
                 capture_output=True,
                 text=True,
+                encoding=_platform_text_encoding(),
+                errors="ignore",
                 timeout=10,
+                **_hidden_subprocess_kwargs(),
             )
         except Exception as exc:
             print(
@@ -3196,6 +3514,37 @@ class BridgeBroker:
             return WorkerProcess.REQUEST_TIMEOUT_SECONDS
         return max(WorkerProcess.REQUEST_TIMEOUT_SECONDS, timeout + 10)
 
+    def _status_if_loaded(self, req: dict[str, Any]) -> dict[str, Any]:
+        session_id = str(req.get("session_id") or "")
+        with self._lock:
+            profile = self._session_profile.get(session_id)
+            worker_key = self._session_worker_key.get(session_id)
+            if profile:
+                key = self._normalize_worker_key(profile, req.get("worker_key")) if "worker_key" in req else worker_key
+            else:
+                fallback_profile = req.get("profile")
+                if fallback_profile is None:
+                    return {"ok": True, "session_id": session_id, "exists": False, "running": False, "loaded": False}
+                profile = self._normalize_profile(fallback_profile)
+                key = self._normalize_worker_key(profile, req.get("worker_key") if "worker_key" in req else None)
+            worker = self._workers.get(key or profile)
+
+        if worker is None or not getattr(worker, "running", False):
+            return {"ok": True, "session_id": session_id, "exists": False, "running": False, "loaded": False}
+
+        forwarded = dict(req)
+        forwarded["action"] = "status"
+        forwarded["profile"] = profile
+        forwarded.pop("worker_key", None)
+        try:
+            resp = worker.request(forwarded, self._worker_request_timeout(req))
+            if resp.get("exists") is not False:
+                self._record_response_routes(profile, key or profile, resp)
+            resp.setdefault("loaded", True)
+            return resp
+        except RuntimeError as e:
+            return {"ok": False, "error": str(e)}
+
     def handle(self, req: dict[str, Any]) -> dict[str, Any]:
         action = str(req.get("action") or "").strip()
         if not action:
@@ -3258,7 +3607,10 @@ class BridgeBroker:
             profile, worker_key = self._route_for_run(str(req.get("run_id") or ""))
             return self._forward(profile, req, worker_key)
 
-        if action in {"interrupt", "steer", "command", "goal_evaluate", "goal_pause", "status", "get_history", "destroy"}:
+        if action == "status_if_loaded":
+            return self._status_if_loaded(req)
+
+        if action in {"interrupt", "steer", "command", "goal_evaluate", "goal_pause", "status", "get_history", "get_session_title", "destroy"}:
             session_id = str(req.get("session_id") or "")
             profile, worker_key = self._route_for_session(session_id, req.get("profile"), req.get("worker_key") if "worker_key" in req else None)
             resp = self._forward(profile, req, worker_key)

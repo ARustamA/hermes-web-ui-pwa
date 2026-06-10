@@ -2,6 +2,7 @@ import { readFile } from 'fs/promises'
 import { join } from 'path'
 import { getActiveProfileName, getProfileDir } from '../../services/hermes/hermes-profile'
 import { restartGatewayForProfile } from '../../services/hermes/gateway-autostart'
+import { readAppConfig, writeAppConfig, normalizeGatewayAutoStartConfig } from '../../services/app-config'
 import { saveEnvValueForProfile } from '../../services/config-helpers'
 import { logger } from '../../services/logger'
 import { safeFileStore } from '../../services/safe-file-store'
@@ -12,8 +13,18 @@ const PLATFORM_SECTIONS = new Set([
   'approvals',
 ])
 
+const APP_CONFIG_SECTIONS = new Set(['gatewayAutoStart'])
+
 function requestedProfile(ctx: any): string {
-  return ctx.state?.profile?.name || getActiveProfileName() || 'default'
+  const headerProfile = typeof ctx.get === 'function' ? ctx.get('x-hermes-profile') : ''
+  const queryProfile = typeof ctx.query?.profile === 'string' ? ctx.query.profile : ''
+  const bodyProfile = typeof ctx.request?.body?.profile === 'string' ? ctx.request.body.profile : ''
+  return ctx.state?.profile?.name ||
+    headerProfile.trim() ||
+    queryProfile.trim() ||
+    bodyProfile.trim() ||
+    getActiveProfileName() ||
+    'default'
 }
 
 const configPath = (profile: string) => join(getProfileDir(profile), 'config.yaml')
@@ -84,6 +95,72 @@ function deepMerge(target: Record<string, any>, source: Record<string, any>): Re
   return target
 }
 
+const AUXILIARY_TASKS = [
+  { key: 'vision', label: 'Vision', default_timeout: 120, default_download_timeout: 30 },
+  { key: 'web_extract', label: 'Web extract', default_timeout: 360 },
+  { key: 'compression', label: 'Compression', default_timeout: 120 },
+  { key: 'skills_hub', label: 'Skills hub', default_timeout: 30 },
+  { key: 'approval', label: 'Approval', default_timeout: 30 },
+  { key: 'mcp', label: 'MCP', default_timeout: 30 },
+  { key: 'title_generation', label: 'Title generation', default_timeout: 30 },
+  { key: 'triage_specifier', label: 'Triage specifier', default_timeout: 120 },
+  { key: 'kanban_decomposer', label: 'Kanban decomposer', default_timeout: 180 },
+  { key: 'profile_describer', label: 'Profile describer', default_timeout: 60 },
+  { key: 'curator', label: 'Curator', default_timeout: 600 },
+  { key: 'session_search', label: 'Session search', default_timeout: 30 },
+  { key: 'flush_memories', label: 'Flush memories', default_timeout: 30 },
+] as const
+
+const AUX_STRING_FIELDS = new Set(['provider', 'model', 'base_url', 'api_key'])
+const AUX_NUMBER_FIELDS = new Set(['timeout', 'download_timeout'])
+
+function isPlainRecord(value: unknown): value is Record<string, any> {
+  return !!value && typeof value === 'object' && !Array.isArray(value)
+}
+
+function isSafeAuxiliaryKey(value: string): boolean {
+  return /^[A-Za-z0-9_.-]{1,80}$/.test(value) &&
+    value !== '__proto__' &&
+    value !== 'prototype' &&
+    value !== 'constructor'
+}
+
+function normalizeAuxiliaryConfig(value: unknown, options: { resetAuto?: boolean } = {}): Record<string, any> {
+  if (!isPlainRecord(value)) return {}
+  const normalized: Record<string, any> = {}
+
+  for (const [task, rawSettings] of Object.entries(value)) {
+    if (!isSafeAuxiliaryKey(task) || !isPlainRecord(rawSettings)) continue
+    const settings: Record<string, any> = {}
+    const provider = typeof rawSettings.provider === 'string' ? rawSettings.provider.trim() : ''
+    const resetToAuto = options.resetAuto === true && provider === 'auto'
+
+    for (const [field, rawValue] of Object.entries(rawSettings)) {
+      if (resetToAuto && field !== 'provider' && field !== 'timeout' && field !== 'download_timeout') continue
+      if (AUX_STRING_FIELDS.has(field)) {
+        if (typeof rawValue !== 'string') continue
+        const trimmed = rawValue.trim()
+        if (trimmed) settings[field] = trimmed
+      } else if (AUX_NUMBER_FIELDS.has(field)) {
+        if (field === 'download_timeout' && task !== 'vision') continue
+        if (rawValue === null || rawValue === undefined || rawValue === '') continue
+        const numberValue = Number(rawValue)
+        if (Number.isFinite(numberValue) && numberValue > 0) {
+          settings[field] = Math.floor(numberValue)
+        }
+      } else if (field === 'extra_body') {
+        if (isPlainRecord(rawValue) && Object.keys(rawValue).length > 0) {
+          settings.extra_body = rawValue
+        }
+      }
+    }
+
+    if (Object.keys(settings).length > 0) normalized[task] = settings
+  }
+
+  return normalized
+}
+
 async function readEnvPlatforms(profile: string): Promise<Record<string, any>> {
   try {
     const raw = await readFile(envPath(profile), 'utf-8')
@@ -109,6 +186,8 @@ export async function getConfig(ctx: any) {
   try {
     const profile = requestedProfile(ctx)
     const config = await readConfig(profile)
+    const appConfig = await readAppConfig()
+    const gatewayAutoStart = normalizeGatewayAutoStartConfig(appConfig.gatewayAutoStart)
     const envPlatforms = await readEnvPlatforms(profile)
     if (Object.keys(envPlatforms).length > 0) {
       const existing = config.platforms || {}
@@ -119,14 +198,22 @@ export async function getConfig(ctx: any) {
     }
     const { section, sections } = ctx.query
     if (section) {
-      ctx.body = { [section as string]: config[section as string] || {} }
+      const key = section as string
+      if (key === 'gatewayAutoStart') {
+        ctx.body = { gatewayAutoStart }
+        return
+      }
+      ctx.body = { [key]: config[key] || {} }
     } else if (sections) {
       const keys = (sections as string).split(',')
       const result: Record<string, any> = {}
-      for (const key of keys) { result[key.trim()] = config[key.trim()] || {} }
+      for (const key of keys) {
+        const trimmed = key.trim()
+        result[trimmed] = trimmed === 'gatewayAutoStart' ? gatewayAutoStart : (config[trimmed] || {})
+      }
       ctx.body = result
     } else {
-      ctx.body = config
+      ctx.body = { ...config, gatewayAutoStart }
     }
   } catch (err: any) {
     ctx.status = 500; ctx.body = { error: err.message }
@@ -139,6 +226,20 @@ export async function updateConfig(ctx: any) {
     ctx.status = 400; ctx.body = { error: 'Missing section or values' }; return
   }
   try {
+    if (APP_CONFIG_SECTIONS.has(section)) {
+      if (section === 'gatewayAutoStart') {
+        const appConfig = await readAppConfig()
+        const next: Record<string, any> = { ...(appConfig.gatewayAutoStart || {}), ...values }
+        if ('include' in values && !Array.isArray(values.include)) delete next.include
+        if ('exclude' in values && !Array.isArray(values.exclude)) delete next.exclude
+        if ('enabled' in values && typeof values.enabled !== 'boolean') delete next.enabled
+        const gatewayAutoStart = normalizeGatewayAutoStartConfig(next)
+        await writeAppConfig({ gatewayAutoStart })
+        ctx.body = { success: true, gatewayAutoStart }
+        return
+      }
+    }
+
     const profile = requestedProfile(ctx)
     await safeFileStore.updateYaml(configPath(profile), (config) => {
       config[section] = deepMerge(config[section] || {}, values)
@@ -167,6 +268,48 @@ export async function updateConfig(ctx: any) {
     ctx.body = { success: true }
   } catch (err: any) {
     ctx.status = 500; ctx.body = { error: err.message }
+  }
+}
+
+export async function getAuxiliaryModels(ctx: any) {
+  try {
+    const profile = requestedProfile(ctx)
+    const config = await readConfig(profile)
+    ctx.body = {
+      tasks: AUXILIARY_TASKS,
+      auxiliary: normalizeAuxiliaryConfig(config.auxiliary),
+    }
+  } catch (err: any) {
+    ctx.status = 500
+    ctx.body = { error: err.message }
+  }
+}
+
+export async function updateAuxiliaryModels(ctx: any) {
+  const body = ctx.request.body as { auxiliary?: unknown }
+  if (!body || !isPlainRecord(body.auxiliary)) {
+    ctx.status = 400
+    ctx.body = { error: 'Missing auxiliary config' }
+    return
+  }
+
+  try {
+    const profile = requestedProfile(ctx)
+    const auxiliary = normalizeAuxiliaryConfig(body.auxiliary, { resetAuto: true })
+    await safeFileStore.updateYaml(configPath(profile), (config) => {
+      if (Object.keys(auxiliary).length > 0) config.auxiliary = auxiliary
+      else delete config.auxiliary
+      return config
+    }, {
+      backup: true,
+      dumpOptions: {
+        forceQuotes: true,
+      },
+    })
+    ctx.body = { success: true, auxiliary }
+  } catch (err: any) {
+    ctx.status = 500
+    ctx.body = { error: err.message }
   }
 }
 

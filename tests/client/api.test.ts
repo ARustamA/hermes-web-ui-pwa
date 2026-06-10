@@ -15,6 +15,7 @@ vi.mock('@/router', () => ({
 import { getApiKey, setApiKey, clearApiKey, hasApiKey, getStoredUserRole, isStoredSuperAdmin, request } from '../../packages/client/src/api/client'
 import { getDownloadUrl } from '../../packages/client/src/api/hermes/download'
 import { uploadFiles } from '../../packages/client/src/api/hermes/files'
+import { importSkill } from '../../packages/client/src/api/hermes/skills'
 import { batchDeleteSessions, importHermesSession } from '../../packages/client/src/api/hermes/sessions'
 import router from '@/router'
 
@@ -158,6 +159,21 @@ describe('API Client', () => {
       await expect(request('/api/hermes/sessions')).rejects.toThrow('API Error 500: Internal Server Error')
     })
 
+    it('extracts nested JSON error messages instead of stringifying objects', async () => {
+      mockFetch.mockResolvedValue({
+        ok: false,
+        status: 500,
+        text: () => Promise.resolve(JSON.stringify({
+          error: {
+            message: 'spawn claude ENOENT',
+            code: 'ENOENT',
+          },
+        })),
+      })
+
+      await expect(request('/api/coding-agents/runs/session-1/input')).rejects.toThrow('API Error 500: spawn claude ENOENT')
+    })
+
     it('returns parsed JSON on success', async () => {
       const data = { sessions: [{ id: '1' }] }
       mockFetch.mockResolvedValue({ ok: true, status: 200, json: () => Promise.resolve(data) })
@@ -180,6 +196,14 @@ describe('API Client', () => {
       expect(url.searchParams.get('profile')).toBe('research')
       expect(url.searchParams.get('token')).toBe('secret-key')
     })
+
+    it('handles raw percent signs in download paths and filenames', () => {
+      const url = new URL(getDownloadUrl('/tmp/100% ready.txt', '100% ready.txt'), 'http://localhost')
+
+      expect(url.pathname).toBe('/api/hermes/download')
+      expect(url.searchParams.get('path')).toBe('/tmp/100% ready.txt')
+      expect(url.searchParams.get('name')).toBe('100% ready.txt')
+    })
   })
 
   describe('file upload', () => {
@@ -197,6 +221,26 @@ describe('API Client', () => {
       expect(mockFetch).toHaveBeenCalledOnce()
       const [url, options] = mockFetch.mock.calls[0]
       expect(url).toBe('/api/hermes/files/upload?path=notes')
+      expect(options.method).toBe('POST')
+      expect(options.headers.Authorization).toBe('Bearer secret-key')
+      expect(options.headers['X-Hermes-Profile']).toBe('research')
+      expect(options.body).toBeInstanceOf(FormData)
+    })
+
+    it('adds auth and active profile headers when importing skills', async () => {
+      setApiKey('secret-key')
+      localStorage.setItem('hermes_active_profile_name', 'research')
+      mockFetch.mockResolvedValue({
+        ok: true,
+        status: 200,
+        text: () => Promise.resolve('{"name":"demo-skill"}'),
+      })
+
+      await importSkill([new File(['# Demo\n'], 'demo.zip', { type: 'application/zip' })])
+
+      expect(mockFetch).toHaveBeenCalledOnce()
+      const [url, options] = mockFetch.mock.calls[0]
+      expect(url).toBe('/api/hermes/skills/import')
       expect(options.method).toBe('POST')
       expect(options.headers.Authorization).toBe('Bearer secret-key')
       expect(options.headers['X-Hermes-Profile']).toBe('research')

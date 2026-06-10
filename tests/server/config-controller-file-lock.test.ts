@@ -22,12 +22,14 @@ vi.mock('../../packages/server/src/services/hermes/agent-bridge', () => ({
 }))
 
 const originalHermesHome = process.env.HERMES_HOME
+const originalWebUiHome = process.env.HERMES_WEB_UI_HOME
 const tempHomes: string[] = []
 let hermesHome = ''
 
 async function loadController() {
   vi.resetModules()
   process.env.HERMES_HOME = hermesHome
+  process.env.HERMES_WEB_UI_HOME = hermesHome
   return import('../../packages/server/src/controllers/hermes/config')
 }
 
@@ -36,6 +38,7 @@ function makeCtx(body: unknown, profile?: string): any {
     request: { body },
     query: {},
     state: profile ? { profile: { name: profile } } : {},
+    get: vi.fn(() => ''),
     status: 200,
     body: undefined,
   }
@@ -52,6 +55,8 @@ afterEach(async () => {
   vi.resetModules()
   if (originalHermesHome === undefined) delete process.env.HERMES_HOME
   else process.env.HERMES_HOME = originalHermesHome
+  if (originalWebUiHome === undefined) delete process.env.HERMES_WEB_UI_HOME
+  else process.env.HERMES_WEB_UI_HOME = originalWebUiHome
   await Promise.all(tempHomes.splice(0).map(dir => rm(dir, { recursive: true, force: true })))
   hermesHome = ''
 })
@@ -79,6 +84,54 @@ describe('config controller locked file updates', () => {
     expect(config.telegram.enabled).toBe(true)
     expect(config.telegram.extra).toEqual({ mode: 'old', token_mode: 'env' })
     expect(config.model.default).toBe('glm-5.1')
+  })
+
+
+  it('reads and writes gateway auto-start policy from Web UI app config', async () => {
+    await writeFile(join(hermesHome, 'config.yaml'), [
+      'model:',
+      '  default: keep-model',
+      '',
+    ].join('\n'), 'utf-8')
+    const { updateConfig, getConfig } = await loadController()
+
+    const writeCtx = makeCtx({
+      section: 'gatewayAutoStart',
+      values: {
+        enabled: true,
+        include: ['default', ' reviewer ', '', 'default'],
+        exclude: ['scratch', ' missing '],
+      },
+    })
+    await updateConfig(writeCtx)
+
+    expect(writeCtx.body).toEqual({
+      success: true,
+      gatewayAutoStart: {
+        enabled: true,
+        include: ['default', 'reviewer'],
+        exclude: ['scratch', 'missing'],
+      },
+    })
+    expect(mockRestartGateway).not.toHaveBeenCalled()
+
+    const persisted = JSON.parse(await readFile(join(hermesHome, 'config.json'), 'utf-8'))
+    expect(persisted.gatewayAutoStart).toEqual({
+      enabled: true,
+      include: ['default', 'reviewer'],
+      exclude: ['scratch', 'missing'],
+    })
+    const yamlConfig = YAML.load(await readFile(join(hermesHome, 'config.yaml'), 'utf-8')) as any
+    expect(yamlConfig.gatewayAutoStart).toBeUndefined()
+    expect(yamlConfig.model.default).toBe('keep-model')
+
+    const readCtx = makeCtx({})
+    await getConfig(readCtx)
+    expect(readCtx.body.gatewayAutoStart).toEqual({
+      enabled: true,
+      include: ['default', 'reviewer'],
+      exclude: ['scratch', 'missing'],
+    })
   })
 
   it('clears credential env values and removes matching config fields without losing unrelated env keys', async () => {
@@ -204,5 +257,108 @@ describe('config controller locked file updates', () => {
     await getConfig(ctx)
     expect(ctx.body.platforms.telegram.token).toBe('new-research-token')
     expect(ctx.body.telegram.require_mention).toBe(true)
+  })
+
+  it('reads and replaces auxiliary model settings in the requested profile', async () => {
+    const researchDir = join(hermesHome, 'profiles', 'research')
+    await mkdir(researchDir, { recursive: true })
+    await writeFile(join(hermesHome, 'config.yaml'), [
+      'model:',
+      '  default: root-model',
+      'auxiliary:',
+      '  compression:',
+      '    provider: openrouter',
+      '    model: root-compressor',
+      '',
+    ].join('\n'), 'utf-8')
+    await writeFile(join(researchDir, 'config.yaml'), [
+      'model:',
+      '  default: research-model',
+      'auxiliary:',
+      '  vision:',
+      '    provider: main',
+      '  web_extract:',
+      '    provider: auto',
+      '    base_url: keep-visible-base-url',
+      '    api_key: keep-visible-api-key',
+      '',
+    ].join('\n'), 'utf-8')
+
+    const { getAuxiliaryModels, updateAuxiliaryModels } = await loadController()
+    const readCtx = makeCtx({})
+    readCtx.get = vi.fn((name: string) => name.toLowerCase() === 'x-hermes-profile' ? 'research' : '')
+
+    await getAuxiliaryModels(readCtx)
+
+    expect(readCtx.body.auxiliary).toEqual({
+      vision: { provider: 'main' },
+      web_extract: {
+        provider: 'auto',
+        base_url: 'keep-visible-base-url',
+        api_key: 'keep-visible-api-key',
+      },
+    })
+    expect(readCtx.body.tasks.some((task: any) => task.key === 'compression' && task.default_timeout === 120)).toBe(true)
+    expect(readCtx.body.tasks.some((task: any) => task.key === 'vision' && task.default_download_timeout === 30)).toBe(true)
+
+    const writeCtx = makeCtx({
+      auxiliary: {
+        compression: {
+          provider: ' openrouter ',
+          model: ' google/gemini-3-flash-preview ',
+          timeout: 120.7,
+          download_timeout: 30,
+          extra_body: { temperature: 0 },
+          ignored: 'drop',
+        },
+        empty_task: {
+          provider: 'auto',
+          model: 'drop-model',
+          base_url: 'drop-base-url',
+          api_key: 'drop-api-key',
+          extra_body: { should: 'drop' },
+          timeout: 30,
+        },
+        blank_task: {
+          provider: '',
+          model: '',
+        },
+      },
+    })
+    writeCtx.get = vi.fn((name: string) => name.toLowerCase() === 'x-hermes-profile' ? 'research' : '')
+
+    await updateAuxiliaryModels(writeCtx)
+
+    expect(writeCtx.body).toEqual({
+      success: true,
+      auxiliary: {
+        compression: {
+          provider: 'openrouter',
+          model: 'google/gemini-3-flash-preview',
+          timeout: 120,
+          extra_body: { temperature: 0 },
+        },
+        empty_task: {
+          provider: 'auto',
+          timeout: 30,
+        },
+      },
+    })
+    const rootConfig = YAML.load(await readFile(join(hermesHome, 'config.yaml'), 'utf-8')) as any
+    const researchConfig = YAML.load(await readFile(join(researchDir, 'config.yaml'), 'utf-8')) as any
+    expect(rootConfig.auxiliary.compression.model).toBe('root-compressor')
+    expect(researchConfig.model.default).toBe('research-model')
+    expect(researchConfig.auxiliary).toEqual({
+      compression: {
+        provider: 'openrouter',
+        model: 'google/gemini-3-flash-preview',
+        timeout: 120,
+        extra_body: { temperature: 0 },
+      },
+      empty_task: {
+        provider: 'auto',
+        timeout: 30,
+      },
+    })
   })
 })

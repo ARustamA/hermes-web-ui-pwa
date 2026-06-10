@@ -228,16 +228,16 @@ function handleSend() {
 }
 
 function handleInput(e: Event) {
-    // 用户手动拖拽自定义高度时，不覆盖
-    if (textareaHeight.value !== null) return
     store.emitTyping()
-    const el = e.target as HTMLTextAreaElement
-    el.style.height = 'auto'
-    el.style.height = Math.min(el.scrollHeight, 100) + 'px'
-
     if (!isComposing.value) {
         updateMentionState()
     }
+
+    // 用户手动拖拽自定义高度时，不覆盖
+    if (textareaHeight.value !== null) return
+    const el = e.target as HTMLTextAreaElement
+    el.style.height = 'auto'
+    el.style.height = Math.min(el.scrollHeight, 100) + 'px'
 }
 
 function handleMentionClick(option: MentionOption) {
@@ -685,6 +685,10 @@ function isImage(type: string): boolean {
     max-height: 400px;
     min-height: 20px;
     overflow-y: auto;
+
+    @media (max-width: 768px) {
+        font-size: 16px;
+    }
 
     &::placeholder {
         color: $text-muted;
